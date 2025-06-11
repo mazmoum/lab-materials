@@ -1,0 +1,126 @@
+#!/bin/bash
+
+set -e  # Stop on error
+
+echo_step() {
+    echo -e "\n $1..."
+}
+
+# Variables
+ARCHIVE="troubleshooting-lab.zip"
+WORKDIR="troubleshooting-lab"
+ZIP_URL="https://raw.githubusercontent.com/mazmoum/lab-materials/refs/heads/main/troubleshooting-lab.zip"
+
+# 1. Create podman network if it doesn't exist
+echo_step "Creating podman network 'troubleshooting-lab' if missing"
+podman network inspect troubleshooting-lab >/dev/null 2>&1 || podman network create troubleshooting-lab
+
+# 2. Remove old containers if they exist
+for c in quotes-api-v1 quotes-api-v2 quotes-ui; do
+    if podman container exists $c; then
+        echo_step "Removing existing container: $c"
+        podman rm -f $c
+    fi
+done
+
+# 3. Download archive if not already present
+if [ ! -f "$ARCHIVE" ]; then
+    echo_step "Downloading $ARCHIVE from GitHub"
+    curl -L -o "$ARCHIVE" "$ZIP_URL"
+else
+    echo "Archive $ARCHIVE already exists. Skipping download."
+fi
+
+# 4. Extract
+echo_step "Extracting archive contents"
+rm -rf "$WORKDIR" && unzip "$ARCHIVE" -d .
+
+# 5. Start quotes-api-v1 (missing network on purpose)
+echo_step "Starting quotes-api-v1"
+podman run -d \
+  --name quotes-api-v1  \
+  -v $(pwd)/$WORKDIR/quotes-api-v1/stubs:/home/wiremock:Z --network troubleshooting-lab ghcr.io/mazmoum/wiremock
+
+# 6. Start quotes-api-v2 ( port in nginx config on purpose)
+echo_step "Starting quotes-api-v2"
+podman run -d \
+  --name quotes-api-v2 \
+  -e PORT=8081 \
+  -v $(pwd)/$WORKDIR/quotes-api-v2/stubs:/home/wiremock:Z --network troubleshooting-lab ghcr.io/mazmoum/wiremock
+
+# 7. Start Creeating 
+
+echo "Creating NGINX Config..."
+cat > nginx-broken.conf << 'EOF'
+worker_processes auto;
+error_log stderr;
+pid /run/nginx.pid;
+
+include /usr/share/nginx/modules/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    types_hash_max_size 2048;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    server {
+        listen 8080;
+        server_name _;
+
+        root /usr/share/nginx/html;
+
+        # Proxy API v1 requests
+        location /api/v1/ {
+            proxy_pass http://quotes-api-v1:8080/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # Proxy API v2 requests
+        location /api/v2/ {
+            proxy_pass http://quotes-api-v2:8080/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # Proxy /api/quotes requests (si utilisé par React UI)
+        location /api/quotes {
+            proxy_pass http://quotes-api-v2:8080/quotes;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
+}
+EOF
+
+# 7. Start quotes-ui with incorrect nginx.conf and no network
+echo_step "Starting quotes-ui with broken NGINX config"
+podman run -d \
+  --name quotes-ui \
+  -p 3000:8080 \
+  -v $(pwd)/nginx-broken.conf:/etc/nginx/nginx.conf:Z \
+  -e QUOTES_API_VERSION=v2 \
+  ghcr.io/mazmoum/quotes-ui-versioning:1.0
+
+# 8. Final message
+echo -e "\n Broken lab environment ready!"
+
